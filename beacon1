@@ -1,0 +1,171 @@
+#include "dw3000.h"
+#define APP_NAME "BEACON TEST v1.3"
+
+// Configuration for DW3000
+static dwt_config_t config = {
+  5, DWT_PLEN_128, DWT_PAC8, 9, 9,
+  1, DWT_BR_6M8, DWT_PHRMODE_STD, DWT_PHRRATE_STD,
+  (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
+};
+
+static uint8_t tx_poll_msg[] = {0xC5, 0, 'B', 'E', 'A', 'C', 'O', 'N'};
+static uint8_t rx_resp_msg[127];
+#define BLINK_FRAME_SN_IDX 1
+#define FRAME_LENGTH (sizeof(tx_poll_msg) + FCS_LEN)
+#define RX_TIMEOUT_MS 1000
+
+uint64_t tx_time, rx_time;
+
+extern dwt_txconfig_t txconfig_options;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println(APP_NAME);
+  spiBegin();
+  spiSelect();
+  delay(200);
+
+  while (!dwt_checkidlerc()) {
+    Serial.println("IDLE FAILED");
+    while (1);
+  }
+
+  dwt_softreset();
+  delay(200);
+
+  while (!dwt_checkidlerc()) {
+    Serial.println("IDLE FAILED");
+    while (1);
+  }
+
+  if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+    Serial.println("INIT FAILED");
+    while (1);
+  }
+
+  if (dwt_configure(&config)) {
+    Serial.println("CONFIG FAILED");
+    while (1);
+  }
+
+  dwt_configuretxrf(&txconfig_options);
+}
+
+void loop() {
+  // Send the ranging request
+  dwt_writetxdata(FRAME_LENGTH - FCS_LEN, tx_poll_msg, 0);
+  dwt_writetxfctrl(FRAME_LENGTH, 0, 0);
+  dwt_starttx(DWT_START_TX_IMMEDIATE);
+
+  // Record timestamp of transmission
+  tx_time = dwt_readsystimestamphi32();
+
+  // Wait for transmission to complete
+  while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {}
+  dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+  Serial.println("TX Frame Sent");
+
+  // Enable receiver to receive the response
+  dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+  // Wait to receive the response
+  uint32_t status;
+  unsigned long start_time = millis();
+  while (!(status = dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_RXFCG_BIT_MASK)) {
+    if (millis() - start_time > RX_TIMEOUT_MS) { // Timeout after 1 second
+      Serial.println("Response timed out");
+      return;
+    }
+  }
+
+  if (status & SYS_STATUS_RXFCG_BIT_MASK) {
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+
+    uint16_t frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_STD_RXFLEN_MASK;
+    if (frame_len <= 127) {
+      dwt_readrxdata(rx_resp_msg, frame_len, 0);
+      Serial.print("Received frame: ");
+      for (int i = 0; i < frame_len; i++) {
+        Serial.print(rx_resp_msg[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      // Record timestamp of reception
+      rx_time = dwt_readsystimestamphi32();
+
+      // Extract timestamps from received frame
+      uint64_t rx_time_anchor = 0;
+      uint64_t tx_time_anchor = 0;
+      memcpy(&rx_time_anchor, rx_resp_msg + 10, sizeof(uint64_t));  // Adjust the offset as needed
+      memcpy(&tx_time_anchor, rx_resp_msg + 18, sizeof(uint64_t)); // Adjust the offset as needed
+
+      // Uncomment the following lines to enable endianness correction
+      rx_time_anchor = reverse64(rx_time_anchor);
+      tx_time_anchor = reverse64(tx_time_anchor);
+
+      // Print timestamps
+      Serial.print("TX Time Beacon: ");
+      Serial.println(tx_time, HEX);
+      Serial.print("RX Time Beacon: ");
+      Serial.println(rx_time, HEX);
+      Serial.print("RX Time Anchor: ");
+      Serial.println(rx_time_anchor, HEX);
+      Serial.print("TX Time Anchor: ");
+      Serial.println(tx_time_anchor, HEX);
+
+      // Print the difference between timestamps
+      Serial.print("Difference RX Beacon - TX Beacon: ");
+      Serial.println(rx_time - tx_time, HEX);
+      Serial.print("Difference TX Anchor - RX Anchor: ");
+      Serial.println(tx_time_anchor - rx_time_anchor, HEX);
+
+      // Calculate round-trip time and distance
+      int64_t t_round1 = (int64_t)rx_time - (int64_t)tx_time;
+      int64_t t_round2 = (int64_t)tx_time_anchor - (int64_t)rx_time_anchor;
+      int64_t rtt = t_round1 - t_round2;
+
+      Serial.print("Round-trip time 1: ");
+      Serial.println(t_round1, HEX);
+      Serial.print("Round-trip time 2: ");
+      Serial.println(t_round2, HEX);
+      Serial.print("RTT: ");
+      Serial.println(rtt, HEX);
+
+      if (rtt < 0) {
+        Serial.println("Negative RTT detected!");
+      } else {
+        double rtt_time_s = convertRttToTime(rtt);
+        Serial.print("RTT Time: ");
+        Serial.print(rtt_time_s, 12); // Print with high precision
+        Serial.println(" s");
+
+        // Calculate distance
+        double distance = (rtt_time_s * 299792458.0) / 2.0; // Speed of light in m/s
+        Serial.print("Distance: ");
+        Serial.print(distance * 1000.0); // Convert to mm
+        Serial.println(" mm");
+      }
+    }
+  }
+
+  delay(1000); // Change this value to experiment with different delays
+  tx_poll_msg[BLINK_FRAME_SN_IDX]++;
+}
+
+uint64_t reverse64(uint64_t value) {
+  value = (value & 0x00000000FFFFFFFF) << 32 | (value & 0xFFFFFFFF00000000) >> 32;
+  value = (value & 0x0000FFFF0000FFFF) << 16 | (value & 0xFFFF0000FFFF0000) >> 16;
+  value = (value & 0x00FF00FF00FF00FF) << 8 | (value & 0xFF00FF00FF00FF00) >> 8;
+  return value;
+}
+
+double convertRttToTime(uint64_t rtt) {
+  double clock_period_ps = 15.65; // Clock period in picoseconds
+  double rtt_time_ps = rtt * clock_period_ps; // RTT time in picoseconds
+  double rtt_time_ns = rtt_time_ps / 1000.0; // RTT time in nanoseconds
+  double rtt_time_s = rtt_time_ns / 1e9; // RTT time in seconds
+  return rtt_time_s;
+}
