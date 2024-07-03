@@ -1,0 +1,101 @@
+#include "dw3000.h"
+#define APP_NAME "ANCHOR TEST v1.3"
+
+static dwt_config_t config = {
+  5, DWT_PLEN_128, DWT_PAC8, 9, 9,
+  1, DWT_BR_6M8, DWT_PHRMODE_STD, DWT_PHRRATE_STD,
+  (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
+};
+
+// Response message format: includes ANCHOR + timestamps
+static uint8_t tx_resp_msg[] = {0xC5, 0, 'A', 'N', 'C', 'H', 'O', 'R', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; // Increased array size to 32
+static uint8_t rx_poll_msg[127];
+#define BLINK_FRAME_SN_IDX 1
+#define FRAME_LENGTH (sizeof(tx_resp_msg) + FCS_LEN)
+#define RX_TIMEOUT_MS 1000
+
+uint64_t tx_time, rx_time;
+
+extern dwt_txconfig_t txconfig_options;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println(APP_NAME);
+  spiBegin();
+  spiSelect();
+  delay(200);
+
+  while (!dwt_checkidlerc()) {
+    Serial.println("IDLE FAILED");
+    while (1);
+  }
+
+  dwt_softreset();
+  delay(200);
+
+  while (!dwt_checkidlerc()) {
+    Serial.println("IDLE FAILED");
+    while (1);
+  }
+
+  if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+    Serial.println("INIT FAILED");
+    while (1);
+  }
+
+  if (dwt_configure(&config)) {
+    Serial.println("CONFIG FAILED");
+    while (1);
+  }
+
+  dwt_configuretxrf(&txconfig_options);
+}
+
+void loop() {
+  dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+  uint32_t status;
+  unsigned long start_time = millis();
+  while (!(status = dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_RXFCG_BIT_MASK)) {
+    if (millis() - start_time > RX_TIMEOUT_MS) { // Timeout after 1 second
+      Serial.println("Response timed out");
+      return;
+    }
+  }
+
+  if (status & SYS_STATUS_RXFCG_BIT_MASK) {
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+
+    uint16_t frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_STD_RXFLEN_MASK;
+    if (frame_len <= 127) {
+      dwt_readrxdata(rx_poll_msg, frame_len, 0);
+      Serial.print("Received frame: ");
+      for (int i = 0; i < frame_len; i++) {
+        Serial.print(rx_poll_msg[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      // Record timestamp of reception
+      rx_time = dwt_readsystimestamphi32();
+
+      // Fill response message with timestamps
+      memcpy(tx_resp_msg + 10, &rx_time, sizeof(uint64_t));  // Adjust the offset as needed
+      tx_time = dwt_readsystimestamphi32();
+      memcpy(tx_resp_msg + 18, &tx_time, sizeof(uint64_t)); // Adjust the offset as needed
+
+      // Send the response
+      dwt_writetxdata(FRAME_LENGTH - FCS_LEN, tx_resp_msg, 0);
+      dwt_writetxfctrl(FRAME_LENGTH, 0, 0);
+      dwt_starttx(DWT_START_TX_IMMEDIATE);
+
+      while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {}
+      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+      Serial.println("Response sent");
+
+      tx_resp_msg[BLINK_FRAME_SN_IDX]++;
+    }
+  }
+}
